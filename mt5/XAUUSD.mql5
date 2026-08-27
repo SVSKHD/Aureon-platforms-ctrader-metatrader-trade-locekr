@@ -1,0 +1,1267 @@
+//+------------------------------------------------------------------+
+//|  AureonPivot_v9.mq6                                              |
+//|                                                                  |
+//|  The R7 mechanism, executed for real. Places live orders.         |
+//|                                                                  |
+//|  PER SESSION                                                      |
+//|    1. anchor  = close of the M1 bar at the session anchor minute  |
+//|    2. pivot   = first close InpDisp ABOVE ref, inside the pivot    |
+//|                 window. Up-moves only. A move DOWN sets nothing -  |
+//|                 measured at +0.23 in Apr-Aug vs +2.58 for up.     |
+//|    3. confirm = first close InpConf away from the pivot.          |
+//|                 above -> BUY, below -> SELL. The market picks     |
+//|                 the side; the EA does not.                        |
+//|    4. exit    = InpStop until the lock arms, then stop parks at    |
+//|                 InpLock and trails giving back InpGive. Optional   |
+//|                 take-profit at whatever the session still owes.   |
+//|    5. repeat  = chip exit becomes the new ref, up to InpMaxChips,  |
+//|                 until InpSessionTarget price $ is banked.         |
+//|                                                                   |
+//|  ALL DISTANCES ARE PRICE DOLLARS. Gold 4000 -> 4010 = 10.00.      |
+//|  At 1.00 lot 1 price $ = $100 account.                            |
+//|                                                                   |
+//|  WHAT WAS ACTUALLY MEASURED (Jan-Aug 2026, 98 trades)             |
+//|    disp 15, conf 5, lock 5, give 2, STOP 20, ONE chip per         |
+//|    session, pivot inside 60 min:                                  |
+//|      win 84.7%, breakeven 70.7%, +3.53 price $/trade, 0 red mo    |
+//|    Stop 15 and multiple chips are NOT in that measurement.        |
+//|    InpWindowFromAnchor=true reproduces the measured rule and in    |
+//|    practice allows about one chip. Setting it false restarts the   |
+//|    window after each exit, which is what makes 3 chips possible    |
+//|    and is untested.                                               |
+//|                                                                   |
+//|  The trail is close-based and every stop is clamped to a          |
+//|  placeable level. R4 measured the bar-extreme alternative as      |
+//|  4.4 points of win rate too optimistic. Do not "fix" this.        |
+//|                                                                   |
+//|  The log records requested vs filled price on every entry, so     |
+//|  slippage can be measured rather than assumed. That is the one    |
+//|  untested cost in the whole result.                               |
+//+------------------------------------------------------------------+
+#property copyright "AUREON AXIS"
+#property version   "9.00"
+
+#include <Trade\Trade.mqh>
+
+//--- sessions, SERVER clock -------------------------------------------
+input bool   InpUseAsia        = false;
+input string InpAsiaAnchor     = "02:00";
+input string InpAsiaEnd        = "09:30";
+input bool   InpUseLondon      = true;
+input string InpLonAnchor      = "09:55";
+input string InpLonEnd         = "16:00";
+input bool   InpUseNY          = true;
+input string InpNYAnchor       = "16:15";
+input string InpNYEnd          = "23:50";
+input int    InpAnchorTolMin   = 5;
+
+//--- the mechanism -----------------------------------------------------
+input double InpDisp           = 15.0;  // PRICE $ above ref that sets the pivot
+input double InpConf           =  5.0;  // PRICE $ from pivot that picks the side
+input int    InpPivotWindow    = 60;    // pivot must form within this many min
+input bool   InpWindowFromAnchor = true;// true = measured rule (~1 chip)
+                                        // false = window restarts after a chip
+input int    InpMinElapsed     = 30;    // min minutes after the anchor
+input int    InpMinLifeMin     = 60;    // min minutes left to open a chip
+input int    InpMaxArmMin       = 45;    // NEW: no entry later than this many
+                                         // minutes after the anchor. Measured:
+                                         // arm<=45 -> 85.5% win, +$10,519
+                                         // arm >45 -> 59.5% win,  -$1,523
+input double InpMaxPivotDisp    = 22.0;  // NEW: skip a pivot that overshot ref
+                                         // by more than this (0 = off)
+
+//--- objective ---------------------------------------------------------
+//  SPLIT EXIT. One entry, one stop, two take-profits.
+//    leg A  InpSplitFracA of the size, exits at InpTargetA (secures the
+//           session agenda: 10 price $, hit in 44 of 49 measured trades)
+//    leg B  the remainder, exits at InpTargetB, or at the stop, or at the
+//           session close.
+//  Both legs share the SAME stop. The measured grid, 49 trades over
+//  2025-10-22 to 2026-08-17, stop 20:
+//     all at 10          +6.96/trade   1 red month   worst -0.7
+//     all at 20          +8.07/trade   3 red months  worst -21.7
+//     70% 10 / 30% 20    +7.29/trade   1 red month   worst -0.7
+//     50% 10 / 50% 20    +7.51/trade   1 red month   worst -6.7
+//  LEG B MAY SIT EITHER SIDE OF LEG A.
+//    TargetB > TargetA  = runner. Measured live: WORSE. On 12 of 43
+//      entries leg A banked +10 and leg B then ran back through the
+//      stop, netting -5 on an entry that would have made +10.
+//      2026 like-for-like: $23,772 split vs $28,991 single.
+//    TargetB < TargetA  = early secure. Measured on the probe grid:
+//      targets 4, 5 and 10 win the IDENTICAL 44 trades and lose the
+//      IDENTICAL 4 of 49 - not one trade reached +4 and then stopped
+//      before +10. So the early leg rescues nothing and books 4 where
+//      it would have booked 10: +4.27/trade against +6.96.
+//    Both are shipped because both were asked for. The single leg at
+//    TargetA remains the best live-measured configuration.
+input double InpSessionTarget  = 10.0;  // PRICE $ the session must secure
+input double InpTargetA        = 10.0;  // leg A take-profit
+input double InpTargetB        =  4.0;  // leg B take-profit (early secure)
+input double InpSplitFracA     = 0.5;   // share of size on leg A (0.5 or 0.7)
+input bool   InpUseSplit       = false;  // false = single position at TargetA
+input bool   InpBEAfterLegB    = false; // when leg B books its target first,
+                                        // move leg A's stop to breakeven.
+                                        // Measured: never fires usefully -
+                                        // no trade reached +4 then stopped -
+                                        // but it is here if you want it.
+input int    InpMaxChips       = 1;     // entries per session
+input bool   InpUseTakeProfit  = true;
+
+//--- exits -------------------------------------------------------------
+input double InpStop           = 15.0;  // PRICE $ hard stop
+input double InpLock           =  5.0;  // PRICE $ that arms the trail
+input double InpGive           =  2.0;  // PRICE $ given back from the best
+input bool   InpUseTrail       = true;
+input double InpStopBuffer     =  0.30;
+
+//--- risk --------------------------------------------------------------
+//  SizeMode FIXED   : every chip risks InpRiskPct of equity.
+//  SizeMode STEP_WIN: risk starts at InpRiskPct and adds InpRiskStep for
+//                     each consecutive win, capped at InpRiskCap. ANY loss
+//                     resets to InpRiskPct immediately.
+//                     Anti-martingale: it presses winners, not losers.
+//  Measured on the 38-trade v3 set (2 losses total):
+//                     fixed 2%          $18,037   maxDD 2.0%
+//                     fixed 3%          $29,231   maxDD 3.0%
+//                     2% +1%/win cap 6% $61,070   maxDD 6.1%
+//  At the same ceiling fixed beats the ramp. The ramp's edge in that
+//  table is the higher ceiling, not the ramp. And that sample has two
+//  losses in it, so it says nothing about a losing streak at full size.
+//  InpDDResetPct is the brake: fall this far from peak equity and the
+//  risk drops back to base until a new high is made.
+enum ESizeMode { SIZE_FIXED, SIZE_STEP_WIN };
+input ESizeMode InpSizeMode    = SIZE_FIXED;
+input double InpRiskPct        = 3.0;   // base % of equity risked per chip
+input double InpRiskStep       = 1.0;   // added per consecutive win
+input double InpRiskCap        = 6.0;   // hard ceiling
+input double InpDDResetPct     = 5.0;   // drop this % from peak -> back to base
+input bool   InpCompound       = true;
+input double InpBaseEquity     = 50000.0;
+input double InpMaxLot         = 20.0;
+input double InpFixedLot       = 0.0;   // >0 overrides risk sizing
+input double InpADRFloor       = 0.0;   // 0 = off, never bound in testing
+
+//--- brakes ------------------------------------------------------------
+input double InpDayLossPct     = 6.0;   // MUST exceed InpRiskPct or the
+                                        // brake fires mid-trade and books
+                                        // losses the trade could recover
+input double InpMonthLockPct   = 0.0;   // halt month once up this %, 0 = off
+
+//--- execution guards (new in v2) --------------------------------------
+input double InpMaxSpread      =  0.60;  // PRICE $ - skip entry above this
+input double InpMaxSlip        =  1.50;  // PRICE $ - bail out if filled worse
+input bool   InpVerifyStop     = true;   // close at once if the SL was rejected
+input bool   InpTickStopGuard  = true;   // emergency close if price passes the SL
+input bool   InpSkipFriday     = true;   // Fridays netted -$121 vs +$2,400/day
+input int    InpFridayCutoff   = 16;     // Friday hour (server) to stop opening
+input int    InpHardFlatHour   = 21;     // NEW: force-flat at this hour on
+input int    InpHardFlatMin    = 30;     // Friday, whatever the broker quotes.
+                                         // A Friday NY chip held to the weekend
+                                         // gapped -34.7 vs a -20 stop (-$941).
+
+//--- plumbing ----------------------------------------------------------
+input ulong  InpMagic          = 990017;
+input int    InpSlippage       = 30;
+input bool   InpLogCSV         = true;
+input string InpTag            = "PIVOT";
+
+
+
+//+------------------------------------------------------------------+
+//|  DECISION JOURNAL - parity between tester and live                |
+//|                                                                   |
+//|  Every DECISION in this EA is taken on the CLOSE of a completed   |
+//|  M1 bar. Nothing branches on spread, tick price, equity or the    |
+//|  clock. So if the tester and a live chart see the same M1 bars,   |
+//|  they must produce the same decision stream, bar for bar.         |
+//|                                                                   |
+//|  This writes that stream to its own file, tagged TESTER or LIVE.  |
+//|  Run the two, diff the files with parity_check.py:                |
+//|    - the DECISION columns must match exactly, every row           |
+//|    - the PRICE columns may differ, and that difference IS the     |
+//|      execution cost: slippage, spread, latency                    |
+//|                                                                   |
+//|  A mismatch in the decision columns is a bug, not a fill.         |
+//+------------------------------------------------------------------+
+input group  "=== Parity journal ==="
+input bool   InpJournalOn      = true;
+
+int      g_hJ=INVALID_HANDLE;
+long     g_jSeq=0;
+
+void JOpen()
+{
+   if(!InpJournalOn) return;
+   string mode = MQLInfoInteger(MQL_TESTER) ? "TESTER" : "LIVE";
+   string fn=StringFormat("aureon_%s_decisions_%s.csv",InpTag,mode);
+   g_hJ=FileOpen(fn,FILE_WRITE|FILE_CSV|FILE_ANSI,',');
+   if(g_hJ==INVALID_HANDLE){ Print("[journal] open failed ",GetLastError()); return; }
+   FileWrite(g_hJ,"seq","bar_time","event","session","bar_close",
+             "anchor","ref","pivot","elapsed_min","detail","price","lot");
+   PrintFormat("[journal] %s -> %s",mode,fn);
+}
+
+//--- bar_close is the DECISION input; price is the EXECUTION result
+void J(const datetime bar,const string ev,const string sess,
+       const double barclose,const double anchor,const double ref,
+       const double pivot,const int elapsed,const string detail,
+       const double price=0.0,const double lot=0.0)
+{
+   if(g_hJ==INVALID_HANDLE) return;
+   FileWrite(g_hJ,++g_jSeq,TimeToString(bar,TIME_DATE|TIME_MINUTES),ev,sess,
+             DoubleToString(barclose,2),DoubleToString(anchor,2),
+             DoubleToString(ref,2),DoubleToString(pivot,2),elapsed,detail,
+             DoubleToString(price,2),DoubleToString(lot,2));
+}
+
+//+------------------------------------------------------------------+
+//|  DISCORD                                                          |
+//|                                                                   |
+//|  OUT  a webhook POST. Tools > Options > Expert Advisors >          |
+//|       "Allow WebRequest for listed URL" MUST contain               |
+//|       https://discord.com  or every call returns error 4014.       |
+//|                                                                    |
+//|  IN   a bot polling GET /channels/{id}/messages. Needs a bot in     |
+//|       the server with Read Messages + Message Content intent.       |
+//|                                                                    |
+//|  The Strategy Tester blocks WebRequest entirely and always returns  |
+//|  -1, so all of this is skipped in the tester rather than filling    |
+//|  the log with failures. Nothing here can affect trading logic: a    |
+//|  failed send is logged and dropped.                                |
+//+------------------------------------------------------------------+
+input group  "=== Discord ==="
+input bool   InpDiscordOn      = true;
+input string InpWebhookURL     = "";     // https://discord.com/api/webhooks/...
+input bool   InpNotifyEntry    = true;
+input bool   InpNotifyExit     = true;
+input bool   InpNotifySession  = false;  // anchor set / session closed
+input bool   InpNotifyAlerts   = true;   // rejects, brakes, guards
+input bool   InpCommandsOn     = false;  // needs the bot token below
+input string InpBotToken       = "";     // Discord bot token
+input string InpChannelID      = "";     // channel the bot watches
+input string InpAllowedUserIDs = "";     // comma separated, empty = anyone
+input int    InpPollSeconds    = 10;
+
+void ForceClose(const string rsn,const datetime bt);
+void CloseLegB(const string rsn,const datetime bt);
+double RiskNow();
+
+bool     g_paused=false;
+string   g_lastMsgID="";
+datetime g_lastSend=0;
+bool     g_netOK=false;
+
+string JEsc(const string t)
+{
+   string o=t;
+   StringReplace(o,"\\","\\\\");
+   StringReplace(o,"\"","\\\"");
+   StringReplace(o,"\n","\\n");
+   StringReplace(o,"\r","");
+   return(o);
+}
+
+bool Post(const string url,const string hdr,const string body,string &out)
+{
+   char data[],res[]; string rh;
+   int len=StringToCharArray(body,data,0,WHOLE_ARRAY,CP_UTF8)-1;
+   if(len<0) len=0;
+   ArrayResize(data,len);
+   ResetLastError();
+   int rc=WebRequest("POST",url,hdr,3000,data,res,rh);
+   if(rc==-1)
+   {
+      int e=GetLastError();
+      if(e==4014)
+         Print("[discord] URL not whitelisted. Tools > Options > Expert "
+               "Advisors > Allow WebRequest, add https://discord.com");
+      else PrintFormat("[discord] POST failed, error %d",e);
+      return(false);
+   }
+   out=CharArrayToString(res,0,WHOLE_ARRAY,CP_UTF8);
+   return(rc>=200 && rc<300);
+}
+
+void DSend(const string text)
+{
+   if(!InpDiscordOn || !g_netOK || InpWebhookURL=="") return;
+   if(TimeCurrent()-g_lastSend<1) Sleep(400);     // Discord rate limit
+   g_lastSend=TimeCurrent();
+   string body="{\"content\":\""+JEsc(text)+"\"}", out;
+   Post(InpWebhookURL,"Content-Type: application/json\r\n",body,out);
+}
+
+//--- minimal extractor: MQL5 has no JSON parser --------------------
+string JField(const string src,const string key,int from,int &endPos)
+{
+   int k=StringFind(src,"\""+key+"\":\"",from);
+   if(k<0){ endPos=-1; return(""); }
+   int a=k+StringLen(key)+4;
+   int b=a;
+   while(b<StringLen(src))
+   {
+      if(StringGetCharacter(src,b)=='\\'){ b+=2; continue; }
+      if(StringGetCharacter(src,b)=='"') break;
+      b++;
+   }
+   endPos=b;
+   return(StringSubstr(src,a,b-a));
+}
+
+bool Allowed(const string uid)
+{
+   if(InpAllowedUserIDs=="") return(true);
+   return(StringFind(InpAllowedUserIDs,uid)>=0);
+}
+
+string StateLine()
+{
+   string s=StringFormat("equity %.2f | risk %.2f%% | %s",
+            AccountInfoDouble(ACCOUNT_EQUITY),
+            (InpSizeMode==SIZE_FIXED?InpRiskPct:RiskNow()),
+            g_paused?"PAUSED":"active");
+   if(g_ticket!=0)
+      s+=StringFormat("\nopen: %s %.2f lot @ %.2f, stop %.2f",
+                      g_dir>0?"BUY":"SELL",g_lot,g_entry,g_slNow);
+   else s+="\nno position";
+   for(int k=0;k<g_ns;k++)
+      if(g_s[k].live)
+         s+=StringFormat("\n%s live: secured %.2f/%.2f, chips %d, pivot %s",
+                         g_s[k].name,g_s[k].secured,InpSessionTarget,
+                         g_s[k].chips,g_s[k].pivot_on?"set":"waiting");
+   return(s);
+}
+
+void DoCommand(const string raw,const string uid)
+{
+   string c=raw; StringTrimLeft(c); StringTrimRight(c); StringToLower(c);
+   if(StringLen(c)==0 || StringGetCharacter(c,0)!='!') return;
+   if(!Allowed(uid)){ DSend("not authorised"); return; }
+
+   if(c=="!help")
+      DSend("`!status` state and open position\n"
+            "`!pause` stop opening new trades\n"
+            "`!resume` allow new trades\n"
+            "`!close` flatten now\n"
+            "`!today` day P/L and secured\n"
+            "`!stats` account totals\n"
+            "`!risk 2.5` set risk percent");
+   else if(c=="!status") DSend(StateLine());
+   else if(c=="!pause")
+   { g_paused=true;  DSend("paused - no new entries"); }
+   else if(c=="!resume")
+   { g_paused=false; DSend("resumed"); }
+   else if(c=="!close")
+   {
+      if(g_ticket==0 && g_ticketB==0) DSend("nothing open");
+      else
+      {
+         if(g_ticketB!=0) CloseLegB("DISCORD",TimeCurrent());
+         if(g_ticket!=0)  ForceClose("DISCORD",TimeCurrent());
+         DSend("flattened by command");
+      }
+   }
+   else if(c=="!today")
+      DSend(StringFormat("day P/L %.2f | equity %.2f | %s",
+            AccountInfoDouble(ACCOUNT_EQUITY)-g_dayStartEq,
+            AccountInfoDouble(ACCOUNT_EQUITY),
+            g_dayHalt?"HALTED":"running"));
+   else if(c=="!stats")
+      DSend(StringFormat("sessions %d, pivoted %d, traded %d\n"
+            "balance %.2f | equity %.2f",g_sessTotal,g_sessPivot,
+            g_sessTraded,AccountInfoDouble(ACCOUNT_BALANCE),
+            AccountInfoDouble(ACCOUNT_EQUITY)));
+   else if(StringFind(c,"!risk ")==0)
+   {
+      double r=StringToDouble(StringSubstr(c,6));
+      if(r<=0 || r>10) DSend("risk must be between 0 and 10");
+      else DSend(StringFormat("risk inputs are read-only at runtime; "
+                 "requested %.2f%%. Change InpRiskPct and reload.",r));
+   }
+   else DSend("unknown command - try `!help`");
+}
+
+void Poll()
+{
+   if(!InpCommandsOn || !g_netOK) return;
+   if(InpBotToken=="" || InpChannelID=="") return;
+
+   string url="https://discord.com/api/v10/channels/"+InpChannelID+
+              "/messages?limit=5";
+   if(g_lastMsgID!="") url+="&after="+g_lastMsgID;
+
+   char data[],res[]; string rh;
+   ResetLastError();
+   int rc=WebRequest("GET",url,"Authorization: Bot "+InpBotToken+"\r\n",
+                     3000,data,res,rh);
+   if(rc!=200) return;
+   string body=CharArrayToString(res,0,WHOLE_ARRAY,CP_UTF8);
+
+   // messages arrive newest first; walk them oldest-last
+   int pos=0; string ids[]; string txt[]; string aut[]; int n=0;
+   while(true)
+   {
+      int ce;
+      string content=JField(body,"content",pos,ce);
+      if(ce<0) break;
+      int cs=StringFind(body,"\"content\":\"",pos);
+      // message id = nearest "id":" before this content
+      string mid=""; int scan=0, last=-1;
+      while(true)
+      {
+         int f=StringFind(body,"\"id\":\"",scan);
+         if(f<0 || f>cs) break;
+         last=f; scan=f+6;
+      }
+      if(last>=0){ int te; mid=JField(body,"id",last,te); }
+      int ae=StringFind(body,"\"author\":{",ce);
+      string uid=""; if(ae>=0){ int ue; uid=JField(body,"id",ae,ue); }
+      if(n<5){ ids[ArrayResize(ids,n+1)-1]=mid; txt[ArrayResize(txt,n+1)-1]=content;
+               aut[ArrayResize(aut,n+1)-1]=uid; n++; }
+      pos=ce+1;
+   }
+   for(int i=n-1;i>=0;i--)
+   {
+      if(ids[i]!="") g_lastMsgID=ids[i];
+      DoCommand(txt[i],aut[i]);
+   }
+}
+
+void OnTimer(){ Poll(); }
+
+//+------------------------------------------------------------------+
+CTrade g_trade;
+
+struct Sess
+{
+   string   name;
+   int      anchor_sec, end_sec;
+   bool     enabled, live, done;
+   double   anchor, ref;
+   double   secured;
+   int      chips;
+   bool     pivot_on;
+   double   pivot;
+   int      pivot_sec;          // when the pivot formed
+   int      window_from;        // sec of day the current window starts
+};
+
+Sess     g_s[3];
+int      g_ns = 0;
+
+datetime g_day=0;  double g_dayStartEq=0; bool g_dayHalt=false;
+int      g_month=-1; double g_monStartEq=0; bool g_monHalt=false;
+
+ulong    g_ticket=0;   // leg A
+ulong    g_ticketB=0;  // leg B, the runner
+double   g_entryB=0, g_lotB=0, g_slB=0;
+int      g_cs=-1, g_dir=0;
+double   g_entry=0, g_req=0, g_lot=0, g_best=0, g_slNow=0;
+bool     g_locked=false;
+datetime g_entryT=0;
+double   g_needAtEntry=0;
+
+datetime g_lastBar=0;
+int      g_hLog=INVALID_HANDLE;
+double   g_pt=0; int g_dg=2;
+
+// diagnostics
+int      g_sessTotal=0, g_sessPivot=0, g_sessTraded=0;
+int      g_winStreak=0;
+double   g_peakEq=0;
+double   g_riskUsed=0;
+double   g_worstClose=0, g_worstExt=0;
+int      g_ddResets=0, g_capHits=0;
+int      g_skipSpread=0, g_skipLot=0, g_bailSlip=0, g_stopFix=0, g_tickStops=0;
+double   g_slipSum=0; int g_slipN=0;
+
+//+------------------------------------------------------------------+
+int HHMMtoSec(const string s)
+{
+   string p[];
+   if(StringSplit(s,':',p)<2) return(-1);
+   return((int)StringToInteger(p[0])*3600+(int)StringToInteger(p[1])*60);
+}
+int SecOfDay(const datetime t)
+{ MqlDateTime d; TimeToStruct(t,d); return(d.hour*3600+d.min*60+d.sec); }
+datetime DayOf(const datetime t){ return(t-(datetime)SecOfDay(t)); }
+int MonthOf(const datetime t)
+{ MqlDateTime d; TimeToStruct(t,d); return(d.year*12+d.mon); }
+
+int BrokerLastSec(const datetime t)
+{
+   MqlDateTime d; TimeToStruct(t,d);
+   datetime f,to; int last=-1;
+   for(int i=0;i<8;i++)
+   {
+      if(!SymbolInfoSessionTrade(_Symbol,(ENUM_DAY_OF_WEEK)d.day_of_week,i,f,to)) break;
+      if((int)to>last) last=(int)to;
+   }
+   return(last<=0?86400:last-60);
+}
+
+double ADR(const int n)
+{
+   double s=0; int c=0;
+   for(int i=1;i<=n+6&&c<n;i++)
+   {
+      double h=iHigh(_Symbol,PERIOD_D1,i), l=iLow(_Symbol,PERIOD_D1,i);
+      if(h<=0||l<=0) continue;
+      s+=(h-l); c++;
+   }
+   return(c>0?s/c:0.0);
+}
+
+double MinStopDist()
+{
+   double lvl=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*g_pt;
+   double spr=(double)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD)*g_pt;
+   return(MathMax(MathMax(lvl,spr*2.0),InpStopBuffer));
+}
+
+//--- the risk actually applied to the next chip ---------------------
+double RiskNow()
+{
+   if(InpSizeMode==SIZE_FIXED) return(InpRiskPct);
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq>g_peakEq) g_peakEq=eq;
+   if(InpDDResetPct>0 && g_peakEq>0
+      && (g_peakEq-eq)/g_peakEq*100.0 >= InpDDResetPct)
+   {
+      if(g_winStreak>0){ g_ddResets++;
+         PrintFormat("[%s] %.2f%% off peak - risk back to base",InpTag,
+                     (g_peakEq-eq)/g_peakEq*100.0); }
+      g_winStreak=0;
+      return(InpRiskPct);
+   }
+   double r=InpRiskPct+InpRiskStep*g_winStreak;
+   if(r>=InpRiskCap){ r=InpRiskCap; g_capHits++; }
+   return(r);
+}
+
+double SizeChip()
+{
+   if(InpFixedLot>0.0){ g_riskUsed=0; return(InpFixedLot); }
+   double eq = InpCompound ? AccountInfoDouble(ACCOUNT_EQUITY) : InpBaseEquity;
+   g_riskUsed=RiskNow();
+   double risk=eq*g_riskUsed/100.0;
+   double out=0.0, px=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   if(!OrderCalcProfit(ORDER_TYPE_BUY,_Symbol,1.0,px,px-InpStop,out))
+      out=-InpStop*100.0;
+   double lpl=MathAbs(out);
+   if(lpl<=0.0) return(0.0);
+   double lot=risk/lpl;
+   double st=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   double mn=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double mx=MathMin(InpMaxLot,SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX));
+   lot=MathFloor(lot/st)*st;
+   if(lot<mn) return(0.0);
+   return(MathMin(mx,lot));
+}
+
+//--- re-attach to a position left open by a restart/recompile --------
+void AdoptOrphan()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+      if(t==0) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic) continue;
+      g_ticket=t;
+      g_dir=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)?1:-1;
+      g_entry=PositionGetDouble(POSITION_PRICE_OPEN);
+      g_req=g_entry;
+      g_lot=PositionGetDouble(POSITION_VOLUME);
+      g_slNow=PositionGetDouble(POSITION_SL);
+      g_entryT=(datetime)PositionGetInteger(POSITION_TIME);
+      g_best=0; g_locked=false; g_cs=-1; g_needAtEntry=InpSessionTarget;
+      PrintFormat("[%s] adopted orphan position %I64u %s %.2f @ %.2f",
+                  InpTag,t,g_dir>0?"BUY":"SELL",g_lot,g_entry);
+      return;
+   }
+}
+
+//--- resolve the position id from the deal, not the order ------------
+ulong PositionIdFromResult()
+{
+   ulong deal=g_trade.ResultDeal();
+   if(deal>0 && HistoryDealSelect(deal))
+   {
+      ulong pid=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
+      if(pid>0) return(pid);
+   }
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+      if(PositionGetString(POSITION_SYMBOL)==_Symbol
+         && PositionGetInteger(POSITION_MAGIC)==(long)InpMagic) return(t);
+   }
+   return(0);
+}
+
+double SpreadNow()
+{ return(SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+        -SymbolInfoDouble(_Symbol,SYMBOL_BID)); }
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   g_dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetDeviationInPoints(InpSlippage);
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+
+   g_ns=0;
+   if(InpUseAsia)
+   { g_s[g_ns].name="ASIA"; g_s[g_ns].anchor_sec=HHMMtoSec(InpAsiaAnchor);
+     g_s[g_ns].end_sec=HHMMtoSec(InpAsiaEnd); g_s[g_ns].enabled=true; g_ns++; }
+   if(InpUseLondon)
+   { g_s[g_ns].name="LONDON"; g_s[g_ns].anchor_sec=HHMMtoSec(InpLonAnchor);
+     g_s[g_ns].end_sec=HHMMtoSec(InpLonEnd); g_s[g_ns].enabled=true; g_ns++; }
+   if(InpUseNY)
+   { g_s[g_ns].name="NY"; g_s[g_ns].anchor_sec=HHMMtoSec(InpNYAnchor);
+     g_s[g_ns].end_sec=HHMMtoSec(InpNYEnd); g_s[g_ns].enabled=true; g_ns++; }
+   if(g_ns==0){ Print("no sessions enabled"); return(INIT_FAILED); }
+
+   if(InpLogCSV)
+   {
+      g_hLog=FileOpen(StringFormat("aureon_%s_trades.csv",InpTag),
+                      FILE_WRITE|FILE_CSV|FILE_ANSI,',');
+      if(g_hLog!=INVALID_HANDLE)
+         FileWrite(g_hLog,"date","session","chip","dir","lot","equity",
+                   "anchor","ref","pivot","pivot_min","arm_min",
+                   "req_price","fill_price","slip",
+                   "entry_t","exit_t","exit","move","pnl","reason",
+                   "best_close","locked","secured","spread_at_entry","risk_pct","win_streak","worst_close","worst_ext");
+   }
+   Print("==================================================================");
+   PrintFormat("  AureonPivot v2   magic %I64u   tag %s",InpMagic,InpTag);
+   PrintFormat("  ENTRY   disp %.1f  conf %.1f  window %d min (%s)  elapsed>=%d",
+               InpDisp,InpConf,InpPivotWindow,
+               InpWindowFromAnchor?"from anchor":"restarts",InpMinElapsed);
+   PrintFormat("  EXIT    stop %.1f  lock %.1f  give %.1f  trail %s  TP %s",
+               InpStop,InpLock,InpGive,InpUseTrail?"on":"off",
+               InpUseTakeProfit?"on":"off");
+   if(InpUseSplit)
+   {
+      PrintFormat("  TARGET  SPLIT  %.0f%% at %.1f  /  %.0f%% at %.1f   "
+                  "shared stop %.1f   maxchips %d   BE-after-B %s",
+                  InpSplitFracA*100,InpTargetA,(1-InpSplitFracA)*100,
+                  InpTargetB,InpStop,InpMaxChips,InpBEAfterLegB?"on":"off");
+      if(InpTargetB<InpTargetA)
+         Print("  *** leg B below leg A: measured +4.27/trade vs +6.96 for a "
+               "single leg at TargetA. Targets 4, 5 and 10 win the same 44 "
+               "trades, so the early leg gives money back. ***");
+   }
+   else
+      PrintFormat("  TARGET  SINGLE %.1f price $   maxchips %d",
+                  InpTargetA,InpMaxChips);
+   if(InpSizeMode==SIZE_FIXED)
+      PrintFormat("  RISK    FIXED %.2f%%/chip  compound %s  maxlot %.1f",
+                  InpRiskPct,InpCompound?"on":"off",InpMaxLot);
+   else
+      PrintFormat("  RISK    STEP_WIN  base %.2f%%  +%.2f%%/win  cap %.2f%%  "
+                  "ddreset %.1f%%  compound %s",InpRiskPct,InpRiskStep,
+                  InpRiskCap,InpDDResetPct,InpCompound?"on":"off");
+   {
+      double topRisk=(InpSizeMode==SIZE_FIXED)?InpRiskPct:InpRiskCap;
+      if(InpDayLossPct>0 && topRisk>InpDayLossPct)
+         PrintFormat("  *** CONTRADICTION: risk up to %.1f%% per chip inside a "
+                     "%.1f%% day brake. The brake will fire mid-trade and book "
+                     "losses the trade could have recovered. Raise "
+                     "InpDayLossPct above %.1f or lower the risk. ***",
+                     topRisk,InpDayLossPct,topRisk);
+   }
+   if(InpSizeMode==SIZE_STEP_WIN && InpRiskCap>=5.0)
+      PrintFormat("  *** cap %.1f%% means %d consecutive losses at full size "
+                  "= -%.0f%% of equity ***",InpRiskCap,3,InpRiskCap*3);
+   PrintFormat("  TIMING  arm window %d-%d min  maxpivotdisp %.1f  "
+               "friday %s (cutoff %02d:00, flat %02d:%02d)",
+               InpMinElapsed,InpMaxArmMin,InpMaxPivotDisp,
+               InpSkipFriday?"blocked":"allowed",InpFridayCutoff,
+               InpHardFlatHour,InpHardFlatMin);
+   PrintFormat("  GUARDS  maxspread %.2f  maxslip %.2f  dayloss %.1f%%  "
+               "monthlock %.1f%%  ADRfloor %.0f",InpMaxSpread,InpMaxSlip,
+               InpDayLossPct,InpMonthLockPct,InpADRFloor);
+   // loud warning when the config is not the one that was measured
+   if(MathAbs(InpDisp-15.0)>0.01 || MathAbs(InpConf-5.0)>0.01
+      || MathAbs(InpLock-5.0)>0.01 || InpPivotWindow!=60)
+      Print("  *** NOT the measured baseline (disp 15 / conf 5 / lock 5 / "
+            "window 60). Results are not comparable to the R7 study. ***");
+   Print("==================================================================");
+
+   g_netOK = !MQLInfoInteger(MQL_TESTER);
+   if(InpDiscordOn && !g_netOK)
+      Print("  [discord] tester detected - WebRequest is blocked, "
+            "notifications disabled for this run");
+   if(InpCommandsOn && g_netOK) EventSetTimer(MathMax(5,InpPollSeconds));
+
+   JOpen();
+   AdoptOrphan();
+   if(InpDiscordOn && g_netOK && InpNotifyAlerts)
+      DSend(StringFormat("**AureonPivot v8 started** %s %s\nequity %.2f | "
+            "risk %.2f%% | disp %.0f conf %.0f | stop %.0f target %.0f",
+            _Symbol,InpTag,AccountInfoDouble(ACCOUNT_EQUITY),InpRiskPct,
+            InpDisp,InpConf,InpStop,InpTargetA));
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int r)
+{
+   EventKillTimer();
+   Print("------------------------- diagnostics -------------------------");
+   PrintFormat("  sessions anchored      : %d",g_sessTotal);
+   PrintFormat("  sessions that pivoted  : %d  (%.1f%%)",g_sessPivot,
+               g_sessTotal>0?100.0*g_sessPivot/g_sessTotal:0);
+   PrintFormat("  sessions that traded   : %d  (%.1f%%)",g_sessTraded,
+               g_sessTotal>0?100.0*g_sessTraded/g_sessTotal:0);
+   PrintFormat("  skipped: spread %d, lot %d   bailed on slippage %d",
+               g_skipSpread,g_skipLot,g_bailSlip);
+   PrintFormat("  stop rejections repaired %d   emergency tick stops %d",
+               g_stopFix,g_tickStops);
+   PrintFormat("  risk cap reached %d times   drawdown resets %d",
+               g_capHits,g_ddResets);
+   if(g_slipN>0)
+      PrintFormat("  MEAN ENTRY SLIPPAGE    : %+.3f price $ over %d fills",
+                  g_slipSum/g_slipN,g_slipN);
+   Print("---------------------------------------------------------------");
+   if(g_hLog!=INVALID_HANDLE) FileClose(g_hLog);
+   if(g_hJ!=INVALID_HANDLE) FileClose(g_hJ);
+}
+
+void ResetSess(const int k)
+{
+   g_s[k].live=false; g_s[k].done=false; g_s[k].anchor=0; g_s[k].ref=0;
+   g_s[k].secured=0; g_s[k].chips=0; g_s[k].pivot_on=false; g_s[k].pivot=0;
+   g_s[k].pivot_sec=0; g_s[k].window_from=0;
+}
+
+void NewDay(const datetime day)
+{
+   g_day=day; g_dayHalt=false;
+   g_dayStartEq=AccountInfoDouble(ACCOUNT_EQUITY);
+   for(int k=0;k<g_ns;k++) ResetSess(k);
+   int m=MonthOf(day);
+   if(m!=g_month){ g_month=m; g_monStartEq=g_dayStartEq; g_monHalt=false; }
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // ---- emergency guard: runs on EVERY tick, not just bar close ----
+   if(InpTickStopGuard && g_ticket!=0 && PositionSelectByTicket(g_ticket))
+   {
+      double sl=PositionGetDouble(POSITION_SL);
+      double px=(g_dir>0)?SymbolInfoDouble(_Symbol,SYMBOL_BID)
+                         :SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+      bool blown=(sl<=0.0)
+                 ? ((px-g_entry)*g_dir <= -InpStop)
+                 : ((g_dir>0 && px<=sl-g_pt) || (g_dir<0 && px>=sl+g_pt));
+      if(blown)
+      {
+         g_tickStops++;
+         PrintFormat("[%s] emergency close: price %.2f past stop %.2f",
+                     InpTag,px,sl);
+         ForceClose("EMERGENCY",TimeCurrent());
+      }
+   }
+
+   // ---- hard Friday flatten, driven by the clock not by bar arrival ----
+   // The -$941 loss happened because the broker stopped quoting before the
+   // session-end bar existed, so the bar-driven flatten never ran and the
+   // position was carried over the weekend.
+   if(g_ticket!=0)
+   {
+      datetime now=TimeTradeServer();
+      MqlDateTime nd; TimeToStruct(now,nd);
+      if(nd.day_of_week==5
+         && (nd.hour>InpHardFlatHour
+             || (nd.hour==InpHardFlatHour && nd.min>=InpHardFlatMin)))
+      {
+         PrintFormat("[%s] Friday hard flatten at %02d:%02d",
+                     InpTag,nd.hour,nd.min);
+         if(g_ticketB!=0) CloseLegB("FRIDAY_FLAT",now);
+         ForceClose("FRIDAY_FLAT",now);
+      }
+   }
+
+   datetime bt=iTime(_Symbol,PERIOD_M1,1);
+   if(bt==0||bt==g_lastBar) return;
+   g_lastBar=bt;
+
+   double c=iClose(_Symbol,PERIOD_M1,1);
+   int sec=SecOfDay(bt);
+   datetime day=DayOf(bt);
+
+   if(day!=g_day)
+   {
+      if(g_ticketB!=0) CloseLegB("ROLLOVER",bt);
+      if(g_ticket!=0) ForceClose("ROLLOVER",bt);
+      NewDay(day);
+   }
+
+   if(InpMonthLockPct>0 && !g_monHalt && g_monStartEq>0)
+   {
+      double gn=(AccountInfoDouble(ACCOUNT_EQUITY)-g_monStartEq)/g_monStartEq*100.0;
+      if(gn>=InpMonthLockPct)
+      { g_monHalt=true; if(g_ticketB!=0) CloseLegB("MONTH_LOCK",bt);
+        if(g_ticket!=0) ForceClose("MONTH_LOCK",bt);
+        PrintFormat("[%s] month locked +%.2f%%",InpTag,gn); }
+   }
+   if(g_monHalt) return;
+
+   if(InpDayLossPct>0 && !g_dayHalt && g_dayStartEq>0)
+   {
+      double dd=(g_dayStartEq-AccountInfoDouble(ACCOUNT_EQUITY))/g_dayStartEq*100.0;
+      if(dd>=InpDayLossPct)
+      { g_dayHalt=true; if(g_ticketB!=0) CloseLegB("DAY_BRAKE",bt);
+        if(g_ticket!=0) ForceClose("DAY_BRAKE",bt);
+        if(InpNotifyAlerts) DSend(StringFormat("**DAY BRAKE** %s at -%.2f%%",
+                                  _Symbol,dd)); }
+   }
+
+   //--- manage the open chip ------------------------------------------
+   //--- leg B is independent: it lives until its own TP, the shared
+   //--- stop, or the session close.
+   if(g_ticketB!=0)
+   {
+      if(!PositionSelectByTicket(g_ticketB))
+      {
+         BookLegB(bt,"");
+         // leg B secured first and leg A is still open -> optional breakeven
+         if(InpBEAfterLegB && g_ticket!=0 && PositionSelectByTicket(g_ticket))
+         {
+            double be=NormalizeDouble(g_entry,g_dg);
+            double md2=MinStopDist();
+            double cap2=c-md2*g_dir;
+            if(g_dir>0) be=MathMin(be,cap2); else be=MathMax(be,cap2);
+            bool better=(g_dir>0)?(be>g_slNow+g_pt):(be<g_slNow-g_pt);
+            if(better && g_trade.PositionModify(g_ticket,be,
+                             PositionGetDouble(POSITION_TP)))
+            {
+               g_slNow=be;
+               PrintFormat("[%s] leg B secured - leg A stop to breakeven %.2f",
+                           InpTag,be);
+            }
+         }
+      }
+      else
+      {
+         int esecB=(g_cs>=0)?MathMin(g_s[g_cs].end_sec,BrokerLastSec(bt)):86400;
+         if(sec>=esecB) CloseLegB("SESSION_END",bt);
+      }
+   }
+
+   if(g_ticket!=0)
+   {
+      if(!PositionSelectByTicket(g_ticket)) BookClosed(bt);
+      else
+      {
+         int esec=(g_cs>=0)?MathMin(g_s[g_cs].end_sec,BrokerLastSec(bt)):86400;
+         if(sec>=esec) ForceClose("SESSION_END",bt);
+         else { ManageTrail(c); return; }   // records MFE/MAE even if trail off
+      }
+   }
+   if(g_dayHalt) return;
+
+   //--- per session -----------------------------------------------------
+   for(int k=0;k<g_ns;k++)
+   {
+      if(!g_s[k].enabled) continue;
+      int endsec=MathMin(g_s[k].end_sec,BrokerLastSec(bt));
+
+      if(!g_s[k].live && !g_s[k].done)
+      {
+         if(sec>=g_s[k].anchor_sec && sec<=g_s[k].anchor_sec+InpAnchorTolMin*60
+            && sec<endsec)
+         {
+            if(InpADRFloor>0 && ADR(14)<InpADRFloor){ g_s[k].done=true; continue; }
+            g_s[k].live=true; g_s[k].anchor=c; g_s[k].ref=c;
+            g_s[k].window_from=sec; g_sessTotal++;
+            J(bt,"ANCHOR",g_s[k].name,c,c,c,0,0,"session opened");
+            if(InpNotifySession)
+               DSend(StringFormat("%s %s anchor %.2f - watching for +%.0f",
+                     _Symbol,g_s[k].name,c,InpDisp));
+            PrintFormat("[%s] %s anchor %.2f",InpTag,g_s[k].name,c);
+         }
+         continue;
+      }
+      if(!g_s[k].live) continue;
+      if(sec>=endsec)
+      {
+         PrintFormat("[%s] %s end. secured %.2f/%.2f in %d chips",InpTag,
+                     g_s[k].name,g_s[k].secured,InpSessionTarget,g_s[k].chips);
+         g_s[k].live=false; g_s[k].done=true; continue;
+      }
+      if(g_paused) continue;
+      if(g_ticket!=0 || g_ticketB!=0) continue;
+      if(g_s[k].chips>=InpMaxChips) continue;
+      if(g_s[k].chips>=InpMaxChips) continue;
+      if((double)(endsec-sec)/60.0 < InpMinLifeMin) continue;
+      if((double)(sec-g_s[k].anchor_sec)/60.0 < InpMinElapsed) continue;
+      if(InpMaxArmMin>0
+         && (double)(sec-g_s[k].anchor_sec)/60.0 > InpMaxArmMin) continue;
+      if(InpSkipFriday)
+      {
+         MqlDateTime _d; TimeToStruct(bt,_d);
+         if(_d.day_of_week==5 && _d.hour>=InpFridayCutoff) continue;
+      }
+
+      //--- stage 1: set the pivot on an UP move only -------------------
+      if(!g_s[k].pivot_on)
+      {
+         int wf = InpWindowFromAnchor ? g_s[k].anchor_sec : g_s[k].window_from;
+         if((double)(sec-wf)/60.0 > InpPivotWindow) continue;
+         if(c-g_s[k].ref >= InpDisp)
+         {
+            if(InpMaxPivotDisp>0 && c-g_s[k].ref > InpMaxPivotDisp)
+            {
+               J(bt,"SKIP_OVERSHOOT",g_s[k].name,c,g_s[k].anchor,g_s[k].ref,0,
+                 (sec-g_s[k].anchor_sec)/60,
+                 StringFormat("disp %.2f > %.2f",c-g_s[k].ref,InpMaxPivotDisp));
+               g_s[k].ref=c; continue;
+            }
+            g_s[k].pivot_on=true; g_s[k].pivot=c; g_s[k].pivot_sec=sec;
+            if(g_s[k].chips==0) g_sessPivot++;
+            J(bt,"PIVOT",g_s[k].name,c,g_s[k].anchor,g_s[k].ref,c,
+              (sec-g_s[k].anchor_sec)/60,
+              StringFormat("disp %.2f",c-g_s[k].ref));
+            PrintFormat("[%s] %s PIVOT %.2f (+%.2f from ref, %d min in)",
+                        InpTag,g_s[k].name,c,c-g_s[k].ref,
+                        (sec-g_s[k].anchor_sec)/60);
+         }
+         continue;
+      }
+
+      //--- stage 2: the market picks the side -------------------------
+      double mv=c-g_s[k].pivot;
+      int dir=0;
+      if(mv>= InpConf) dir= 1;
+      if(mv<=-InpConf) dir=-1;
+      if(dir==0) continue;
+
+      J(bt,"CONFIRM",g_s[k].name,c,g_s[k].anchor,g_s[k].ref,g_s[k].pivot,
+        (sec-g_s[k].anchor_sec)/60,
+        StringFormat("%s move %.2f",dir>0?"LONG":"SHORT",mv));
+      OpenChip(k,dir,bt,sec);
+   }
+}
+
+//+------------------------------------------------------------------+
+void OpenChip(const int k,const int dir,const datetime bt,const int sec)
+{
+   double spr=SpreadNow();
+   if(InpMaxSpread>0 && spr>InpMaxSpread)
+   {
+      g_skipSpread++;
+      J(bt,"SKIP_SPREAD",g_s[k].name,0,g_s[k].anchor,g_s[k].ref,g_s[k].pivot,
+        (sec-g_s[k].anchor_sec)/60,StringFormat("spread %.2f",spr));
+      PrintFormat("[%s] spread %.2f > %.2f - entry skipped",InpTag,spr,InpMaxSpread);
+      return;
+   }
+   double lot=SizeChip();
+   if(lot<=0){ g_skipLot++; PrintFormat("[%s] lot rounds to zero",InpTag); return; }
+
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double req=(dir>0?ask:bid);
+   double md =MinStopDist();
+
+   double need=InpSessionTarget-g_s[k].secured;
+   double sl=NormalizeDouble(req-InpStop*dir,g_dg);
+   double tp=0.0;
+   if(InpUseTakeProfit)
+   {
+      if(need<md) need=md;
+      tp=NormalizeDouble(req+need*dir,g_dg);
+   }
+
+   //--- split the size between the two legs -------------------------
+   double vstep=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   double vmin =SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double lotA=lot, lotB=0.0;
+   bool split=InpUseSplit;
+   if(split)
+   {
+      lotA=MathFloor(lot*InpSplitFracA/vstep)*vstep;
+      lotB=MathFloor((lot-lotA)/vstep)*vstep;
+      if(lotA<vmin || lotB<vmin)
+      {
+         // too small to divide honestly - run one leg at TargetA
+         lotA=lot; lotB=0.0; split=false;
+         PrintFormat("[%s] lot %.2f cannot split at step %.2f - single leg",
+                     InpTag,lot,vstep);
+      }
+   }
+   double tpA=NormalizeDouble(req+MathMax(InpTargetA,md)*dir,g_dg);
+   double tpB=NormalizeDouble(req+MathMax(InpTargetB,md)*dir,g_dg);
+   tp=tpA;
+
+   bool ok=(dir>0)? g_trade.Buy (lotA,_Symbol,0.0,sl,tpA,"AX_PIVOT_A")
+                  : g_trade.Sell(lotA,_Symbol,0.0,sl,tpA,"AX_PIVOT_A");
+   if(!ok)
+   {
+      PrintFormat("[%s] OPEN FAILED %d %s",InpTag,g_trade.ResultRetcode(),
+                  g_trade.ResultRetcodeDescription());
+      return;
+   }
+   g_ticket=PositionIdFromResult();
+   if(g_ticket==0){ PrintFormat("[%s] opened but no position id",InpTag); return; }
+   g_entry=PositionSelectByTicket(g_ticket)?
+           PositionGetDouble(POSITION_PRICE_OPEN):req;
+   g_req=req; g_cs=k; g_dir=dir; g_lot=lotA; g_best=0; g_locked=false;
+   g_slNow=sl; g_entryT=bt; g_needAtEntry=MathMax(InpTargetA,md);
+   g_worstClose=0; g_worstExt=0;
+   g_ticketB=0; g_entryB=0; g_lotB=0; g_slB=0;
+
+   //--- leg B: the runner, same stop, further target ----------------
+   if(split && lotB>=vmin)
+   {
+      bool okB=(dir>0)? g_trade.Buy (lotB,_Symbol,0.0,sl,tpB,"AX_PIVOT_B")
+                      : g_trade.Sell(lotB,_Symbol,0.0,sl,tpB,"AX_PIVOT_B");
+      if(okB)
+      {
+         g_ticketB=PositionIdFromResult();
+         if(g_ticketB==g_ticket) g_ticketB=0;
+         if(g_ticketB!=0)
+         {
+            g_entryB=PositionSelectByTicket(g_ticketB)?
+                     PositionGetDouble(POSITION_PRICE_OPEN):req;
+            g_lotB=lotB; g_slB=sl;
+            PrintFormat("[%s]   leg B %.2f lot @ %.2f -> tp %.2f",
+                        InpTag,lotB,g_entryB,tpB);
+         }
+      }
+      else PrintFormat("[%s] leg B failed %d - leg A runs alone",
+                       InpTag,g_trade.ResultRetcode());
+   }
+
+   double slip=(g_entry-req)*dir;
+   g_slipSum+=slip; g_slipN++;
+
+   J(bt,"ENTRY",g_s[k].name,0,g_s[k].anchor,g_s[k].ref,g_s[k].pivot,
+     (sec-g_s[k].anchor_sec)/60,
+     StringFormat("%s req %.2f slip %+.2f",dir>0?"BUY":"SELL",req,slip),
+     g_entry,lotA);
+
+   // filled far worse than asked -> get out now, do not carry it
+   if(InpMaxSlip>0 && slip>InpMaxSlip)
+   {
+      g_bailSlip++;
+      PrintFormat("[%s] slippage %+.2f > %.2f - closing immediately",
+                  InpTag,slip,InpMaxSlip);
+      ForceClose("SLIP_BAIL",bt);
+      return;
+   }
+
+   // the stop must actually be resting at the broker
+   if(InpVerifyStop && PositionSelectByTicket(g_ticket))
+   {
+      if(PositionGetDouble(POSITION_SL)<=0.0)
+      {
+         if(g_trade.PositionModify(g_ticket,sl,tp)) { g_stopFix++; g_slNow=sl; }
+         else
+         {
+            if(InpNotifyAlerts)
+            DSend(StringFormat("**STOP REJECTED** %s - position flattened",
+                  _Symbol));
+         PrintFormat("[%s] SL REJECTED (%d) - flattening",InpTag,
+                        g_trade.ResultRetcode());
+            ForceClose("NO_STOP",bt);
+            return;
+         }
+      }
+   }
+
+   PrintFormat("[%s] %s %s %.2f @ %.2f (req %.2f, slip %+.2f)  pivot %.2f  "
+               "need %.2f  sl %.2f tp %.2f",InpTag,g_s[k].name,
+               dir>0?"BUY":"SELL",lot,g_entry,req,(g_entry-req)*dir,
+               g_s[k].pivot,need,sl,tp);
+}
+
+//+------------------------------------------------------------------+
+void ManageTrail(const double close_px)
+{
+   // best_close is recorded ALWAYS - it is the only record of how far a
+   // trade travelled, and it is what tells us whether the target is set
+   // too tight. v2 tracked it only when the trail was on, so every
+   // best_close came out 0.00.
+   double exc=(close_px-g_entry)*g_dir;
+   if(exc>g_best) g_best=exc;
+   // MAE: how far the trade went AGAINST us before resolving. Without this
+   // the stop cannot be sized - we know what the losers did, but nothing
+   // about how much heat the winners took on the way.
+   double lo=iLow(_Symbol,PERIOD_M1,1), hi=iHigh(_Symbol,PERIOD_M1,1);
+   double advExt=(g_dir>0)?(lo-g_entry):(g_entry-hi);
+   if(advExt<g_worstExt) g_worstExt=advExt;
+   if(exc<g_worstClose) g_worstClose=exc;
+   if(!InpUseTrail) return;
+   if(!g_locked && g_best>=InpLock) g_locked=true;
+   if(!g_locked) return;
+
+   double want=g_entry+MathMax(InpLock,g_best-InpGive)*g_dir;
+   double md=MinStopDist();
+   double cap=close_px-md*g_dir;
+   if(g_dir>0) want=MathMin(want,cap); else want=MathMax(want,cap);
+   if(g_dir>0 && want<=g_slNow+g_pt) return;
+   if(g_dir<0 && want>=g_slNow-g_pt) return;
+
+   want=NormalizeDouble(want,g_dg);
+   double tp=PositionGetDouble(POSITION_TP);
+   if(g_trade.PositionModify(g_ticket,want,tp)) g_slNow=want;
+}
+
+//+------------------------------------------------------------------+
+void BookLegB(const datetime bt,const string forced)
+{
+   if(g_ticketB==0) return;
+   double xp=0,profit=0; datetime xt=bt;
+   if(HistorySelectByPosition(g_ticketB))
+   {
+      int n=HistoryDealsTotal();
+      for(int i=0;i<n;i++)
+      {
+         ulong dt=HistoryDealGetTicket(i);
+         if(dt==0) continue;
+         if(HistoryDealGetInteger(dt,DEAL_ENTRY)==DEAL_ENTRY_OUT)
+         { xp=HistoryDealGetDouble(dt,DEAL_PRICE);
+           xt=(datetime)HistoryDealGetInteger(dt,DEAL_TIME); }
+         profit+=HistoryDealGetDouble(dt,DEAL_PROFIT)
+                +HistoryDealGetDouble(dt,DEAL_SWAP)
+                +HistoryDealGetDouble(dt,DEAL_COMMISSION);
+      }
+   }
+   if(xp<=0) xp=iClose(_Symbol,PERIOD_M1,1);
+   double move=(xp-g_entryB)*g_dir;
+   string rsn=forced;
+   if(rsn=="")
+   {
+      if(move>=InpTargetB-0.05)      rsn="TARGET_B";
+      else if(move<=-InpStop+0.05)   rsn="STOP_B";
+      else                           rsn="OTHER_B";
+   }
+
+   if(g_cs>=0) g_s[g_cs].secured+=move;
+   PrintFormat("[%s] LEG B %s %+.2f price $ ($%+.2f)",InpTag,rsn,move,profit);
+
+   if(g_hLog!=INVALID_HANDLE && g_cs>=0)
+      FileWrite(g_hLog,TimeToString(g_day,TIME_DATE),g_s[g_cs].name,0,
+                g_dir,DoubleToString(g_lotB,2),
+                DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2),
+                DoubleToString(g_s[g_cs].anchor,2),
+                DoubleToString(g_s[g_cs].ref,2),
+                DoubleToString(g_s[g_cs].pivot,2),
+                (g_s[g_cs].pivot_sec-g_s[g_cs].anchor_sec)/60,
+                (SecOfDay(g_entryT)-g_s[g_cs].anchor_sec)/60,
+                DoubleToString(g_req,2),DoubleToString(g_entryB,2),
+                DoubleToString(0.0,2),
+                TimeToString(g_entryT,TIME_MINUTES),
+                TimeToString(xt,TIME_MINUTES),
+                DoubleToString(xp,2),DoubleToString(move,2),
+                DoubleToString(profit,2),rsn,
+                DoubleToString(0.0,2),0,
+                DoubleToString(g_s[g_cs].secured,2),
+                DoubleToString(SpreadNow(),2),
+                DoubleToString(g_riskUsed,2),g_winStreak,
+                DoubleToString(0.0,2),DoubleToString(0.0,2));
+
+   g_ticketB=0; g_entryB=0; g_lotB=0; g_slB=0;
+}
+
+void CloseLegB(const string rsn,const datetime bt)
+{
+   if(g_ticketB==0) return;
+   if(PositionSelectByTicket(g_ticketB))
+      g_trade.PositionClose(g_ticketB,InpSlippage);
+   BookLegB(bt,rsn);
+}
+
+void ForceClose(const string rsn,const datetime bt)
+{
+   if(g_ticket==0) return;
+   if(PositionSelectByTicket(g_ticket))
+      g_trade.PositionClose(g_ticket,InpSlippage);
+   BookClosed(bt,rsn);
+}
+
+void BookClosed(const datetime bt,const string forced="")
+{
+   double exit_px=0, profit=0; datetime exit_t=bt;
+   if(HistorySelectByPosition(g_ticket))
+   {
+      int n=HistoryDealsTotal();
+      for(int i=0;i<n;i++)
+      {
+         ulong dt=HistoryDealGetTicket(i);
+         if(dt==0) continue;
+         if(HistoryDealGetInteger(dt,DEAL_ENTRY)==DEAL_ENTRY_OUT)
+         { exit_px=HistoryDealGetDouble(dt,DEAL_PRICE);
+           exit_t=(datetime)HistoryDealGetInteger(dt,DEAL_TIME); }
+         profit+=HistoryDealGetDouble(dt,DEAL_PROFIT)
+                +HistoryDealGetDouble(dt,DEAL_SWAP)
+                +HistoryDealGetDouble(dt,DEAL_COMMISSION);
+      }
+   }
+   if(exit_px<=0) exit_px=iClose(_Symbol,PERIOD_M1,1);
+
+   double move=(exit_px-g_entry)*g_dir;
+   string rsn=forced;
+   if(rsn=="")
+      rsn=(move>=g_needAtEntry-0.05)?"TARGET":(g_locked?"TRAIL":"STOP");
+
+   int k=g_cs;
+   if(k>=0)
+   {
+      if(g_s[k].chips==0) g_sessTraded++;
+      if(InpSizeMode==SIZE_STEP_WIN)
+      {
+         if(move>0) g_winStreak++;
+         else       g_winStreak=0;
+      }
+      g_s[k].secured+=move;
+      g_s[k].chips++;
+      g_s[k].ref=exit_px;                 // re-anchor
+      g_s[k].pivot_on=false;              // a fresh pivot is required
+      g_s[k].window_from=SecOfDay(bt);    // used when window restarts
+   }
+
+   J(exit_t,"EXIT",(k>=0?g_s[k].name:"?"),0,(k>=0?g_s[k].anchor:0),
+     (k>=0?g_s[k].ref:0),(k>=0?g_s[k].pivot:0),0,
+     StringFormat("%s move %+.2f",rsn,move),exit_px,g_lot);
+   if(InpNotifyExit && k>=0)
+      DSend(StringFormat("%s **%s** %s %s\nmove %+.2f price $ | **$%+.2f**\n"
+            "secured %.2f/%.2f | day %+.2f",
+            (move>0?"[WIN] ":"[LOSS]"),rsn,_Symbol,g_s[k].name,move,profit,
+            g_s[k].secured,InpSessionTarget,
+            AccountInfoDouble(ACCOUNT_EQUITY)-g_dayStartEq));
+   PrintFormat("[%s] %s CHIP %d %s %+.2f price $ ($%+.2f) secured %.2f/%.2f",
+               InpTag,(k>=0?g_s[k].name:"?"),(k>=0?g_s[k].chips:0),rsn,move,
+               profit,(k>=0?g_s[k].secured:0),InpSessionTarget);
+
+   if(g_hLog!=INVALID_HANDLE && k>=0)
+      FileWrite(g_hLog,TimeToString(g_day,TIME_DATE),g_s[k].name,g_s[k].chips,
+                g_dir,DoubleToString(g_lot,2),
+                DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2),
+                DoubleToString(g_s[k].anchor,2),DoubleToString(g_s[k].ref,2),
+                DoubleToString(g_s[k].pivot,2),
+                (g_s[k].pivot_sec-g_s[k].anchor_sec)/60,
+                (SecOfDay(g_entryT)-g_s[k].anchor_sec)/60,
+                DoubleToString(g_req,2),DoubleToString(g_entry,2),
+                DoubleToString((g_entry-g_req)*g_dir,2),
+                TimeToString(g_entryT,TIME_MINUTES),
+                TimeToString(exit_t,TIME_MINUTES),
+                DoubleToString(exit_px,2),DoubleToString(move,2),
+                DoubleToString(profit,2),rsn,
+                DoubleToString(g_best,2),(int)g_locked,
+                DoubleToString(g_s[k].secured,2),
+                DoubleToString(SpreadNow(),2),
+                DoubleToString(g_riskUsed,2),g_winStreak,
+                DoubleToString(g_worstClose,2),DoubleToString(g_worstExt,2));
+
+   g_ticket=0; g_cs=-1; g_dir=0; g_entry=0; g_req=0; g_lot=0;
+   g_best=0; g_locked=false; g_slNow=0; g_needAtEntry=0;
+   g_worstClose=0; g_worstExt=0;
+}
+//+------------------------------------------------------------------+
